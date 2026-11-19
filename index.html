@@ -102,6 +102,11 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .sigsaved{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}
 .sigitem{position:relative;border:1px solid var(--line);border-radius:8px;padding:4px;background:#fff}.sigitem img{height:44px;cursor:pointer;display:block}
 .sigitem .x{position:absolute;top:-8px;right:-8px;background:#fff}
+.cand{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin:6px 0;background:#fff;cursor:pointer}
+.cand input{margin-top:3px}.cl{font-size:14px;word-break:break-word}
+.badge{display:inline-block;margin-left:6px;background:#dcfce7;color:#166534;border-radius:20px;padding:1px 8px;font-size:11px;font-weight:600}
+.warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:10px;padding:8px 12px;font-size:13px;margin:8px 0 14px}
+.rectrow{display:flex;gap:8px;align-items:center;justify-content:space-between;margin:4px 0;font-size:13px}
 .mdout{font-family:ui-monospace,Consolas,monospace;font-size:13px;width:100%}
 .banner{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:10px;padding:12px 14px;margin:10px 0}
 #toasts{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);display:grid;gap:8px;z-index:99}
@@ -485,7 +490,7 @@ function templateBar(toolId, form) {
 }
 
 /* ---------- live preview (pdf.js page + overlay drawn by the tool) ---------- */
-function createPreview({ onDraw, getRotation, onPage, width = 1000 } = {}) {
+function createPreview({ onDraw, getRotation, onPage, onFile, width = 1000 } = {}) {
   const st = { files: [], file: null, doc: null, page: 1, total: 0, base: null, pw: 0, ph: 0, token: 0 };
   const canvas = h('canvas', { class: 'pv-canvas hide' });
   const ctx = canvas.getContext('2d');
@@ -497,13 +502,14 @@ function createPreview({ onDraw, getRotation, onPage, width = 1000 } = {}) {
   const el = h('div', { class: 'pv' }, h('div', { class: 'pv-top' }, sel, prev, lbl, next), h('div', { class: 'pv-box' }, msg, canvas));
 
   function showMsg(t) { msg.textContent = t; msg.classList.remove('hide'); canvas.classList.add('hide'); lbl.textContent = '–'; st.base = null; }
-  async function load(file) {
-    if (!file) { st.file = null; st.doc = null; showMsg('Add a PDF to see the live preview.'); return; }
-    const t = ++st.token; st.file = file;
+  async function load(file, keep, asFile) {
+    if (!file) { st.file = null; st.doc = null; showMsg('Add a PDF to see the live preview.'); if (!keep && onFile) onFile(null); return; }
+    const t = ++st.token; st.file = asFile || file;
+    if (!keep && onFile) onFile(st.file);
     try {
       const doc = await loadJs(file);
       if (t !== st.token) return;
-      st.doc = doc; st.total = doc.numPages; st.page = 1;
+      st.doc = doc; st.total = doc.numPages; st.page = keep ? Math.min(st.page, st.total) : 1;
       await loadPage();
     } catch (e) {
       if (t !== st.token) return;
@@ -541,7 +547,7 @@ function createPreview({ onDraw, getRotation, onPage, width = 1000 } = {}) {
     const i = files.indexOf(st.file);
     if (i >= 0) sel.value = i; else load(files[0] || null);
   }
-  return { el, canvas, st, draw, setFiles, setPage(n) { if (st.doc && n >= 1 && n <= st.total) { st.page = n; return loadPage(); } } };
+  return { el, canvas, st, draw, setFiles, reloadFile(file, asFile) { return load(file, true, asFile); }, setPage(n) { if (st.doc && n >= 1 && n <= st.total) { st.page = n; return loadPage(); } } };
 }
 
 /* layout helpers */
@@ -1348,6 +1354,462 @@ tool({
   }
 });
 
+/* ===================== REMOVE WATERMARK ===================== */
+const { PDFName, PDFDict, PDFArray, PDFStream, PDFNumber } = window.PDFLib || {};
+const safe = fn => { try { return fn(); } catch (e) { return undefined; } };
+
+/* ---------- content stream parser (tokens -> operators with byte ranges) ---------- */
+const WSP = new Set([0, 9, 10, 12, 13, 32]);
+const DLM = new Set([40, 41, 60, 62, 91, 93, 123, 125, 47, 37]);
+const NUM_RE = /^[+-]?(\d+\.?\d*|\.\d+)$/;
+const asc = (b, s, e) => { let r = ''; for (let i = s; i < e; i++) r += String.fromCharCode(b[i]); return r; };
+
+function parseContent(b) {
+  const ops = [], n = b.length; let args = [], i = 0;
+  const push = (t, s, e, v) => args.push({ t, s, e, v });
+  const emit = (op, s, e) => { ops.push({ op, args, s: args.length ? args[0].s : s, e }); args = []; };
+  while (i < n) {
+    const c = b[i];
+    if (WSP.has(c)) { i++; continue; }
+    const st = i;
+    if (c === 37) { while (i < n && b[i] !== 10 && b[i] !== 13) i++; continue; }
+    if (c === 40) {
+      let d = 1; i++;
+      while (i < n && d) { const x = b[i]; if (x === 92) i += 2; else { if (x === 40) d++; else if (x === 41) d--; i++; } }
+      push('str', st, i); continue;
+    }
+    if (c === 60) {
+      if (b[i + 1] === 60) { i += 2; push('dopen', st, i); }
+      else { i++; while (i < n && b[i] !== 62) i++; i++; push('hex', st, i); }
+      continue;
+    }
+    if (c === 62) { if (b[i + 1] === 62) { i += 2; push('dclose', st, i); } else i++; continue; }
+    if (c === 91) { i++; push('aopen', st, i); continue; }
+    if (c === 93) { i++; push('aclose', st, i); continue; }
+    if (c === 123 || c === 125 || c === 41) { i++; continue; }
+    if (c === 47) {
+      i++; while (i < n && !WSP.has(b[i]) && !DLM.has(b[i])) i++;
+      push('name', st, i, asc(b, st + 1, i).replace(/#([0-9a-fA-F]{2})/g, (m, x) => String.fromCharCode(parseInt(x, 16))));
+      continue;
+    }
+    while (i < n && !WSP.has(b[i]) && !DLM.has(b[i])) i++;
+    if (i === st) { i++; continue; }
+    const v = asc(b, st, i);
+    if (NUM_RE.test(v)) push('num', st, i, parseFloat(v));
+    else if (v === 'true' || v === 'false' || v === 'null') push('kw', st, i, v);
+    else {
+      emit(v, st, i);
+      if (v === 'ID') { // inline image data: skip binary until EI
+        if (i < n && WSP.has(b[i])) i++;
+        let j = i;
+        for (; j < n; j++) if (b[j] === 69 && b[j + 1] === 73 && (j === 0 || WSP.has(b[j - 1])) && (j + 2 >= n || WSP.has(b[j + 2]))) break;
+        const e = Math.min(n, j + 2);
+        ops.push({ op: 'EI', args: [], s: j, e }); i = e;
+      }
+    }
+  }
+  return ops;
+}
+const mmul = (m, n) => [m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3], m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3], m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]];
+const numArgs = a => a.filter(t => t.t === 'num').map(t => t.v);
+const angleOf = m => Math.round(Math.atan2(m[1], m[0]) * 180 / Math.PI);
+const isTilted = ang => { const r = ((ang % 90) + 90) % 90; return r > 1.5 && r < 88.5; };
+const numOf = x => x instanceof PDFNumber ? x.asNumber() : 0;
+function hash32(b, s = 0, e = b.length) {
+  let h = 0x811c9dc5;
+  for (let i = s; i < e; i++) { h ^= b[i]; h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(36) + '-' + (e - s).toString(36);
+}
+function literalText(b, s, e) {
+  let out = '', i = s + 1; const end = e - 1;
+  while (i < end) {
+    let c = b[i++];
+    if (c === 92) {
+      const d = b[i++];
+      if (d === 110) c = 10; else if (d === 114) c = 13; else if (d === 116) c = 9;
+      else if (d >= 48 && d <= 55) { let v = d - 48, k = 0; while (k < 2 && b[i] >= 48 && b[i] <= 55) { v = v * 8 + b[i++] - 48; k++; } c = v; }
+      else c = d;
+    }
+    if (c === 0) return null;
+    out += c >= 32 && c < 127 ? String.fromCharCode(c) : ' ';
+  }
+  return out;
+}
+
+/* ---------- page content ---------- */
+function pageContentBytes(page) {
+  const c = page.node.Contents();
+  if (!c) return null;
+  const dec = PDFLib.decodePDFRawStream;
+  if (!dec) throw new Error('decodePDFRawStream is missing');
+  const parts = [];
+  if (c instanceof PDFArray) { for (let i = 0; i < c.size(); i++) parts.push(dec(c.lookup(i, PDFStream)).decode()); }
+  else parts.push(dec(c).decode());
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length + 1, 0));
+  let o = 0; parts.forEach(p => { out.set(p, o); o += p.length; out[o++] = 10; });
+  return out;
+}
+
+/* Find every object on a page that could be a watermark. Ranges (s,e) point into `bytes`. */
+function analyzePage(page) {
+  const items = [];
+  const res = safe(() => page.node.Resources());
+  const sub = nm => safe(() => res && res.lookupMaybe(PDFName.of(nm), PDFDict));
+  const xobjs = sub('XObject'), gss = sub('ExtGState'), props = sub('Properties');
+  const bytes = safe(() => pageContentBytes(page));
+
+  if (bytes && bytes.length) {
+    const ops = parseContent(bytes);
+    let gs = { alpha: 1, ctm: [1, 0, 0, 1, 0, 0] };
+    const gstack = [], mc = [];
+    let bt = null, biStart = -1;
+    const inWm = () => mc.some(x => x.flag);
+    for (const o of ops) {
+      const a = o.args;
+      switch (o.op) {
+        case 'q': gstack.push({ alpha: gs.alpha, ctm: gs.ctm }); break;
+        case 'Q': if (gstack.length) gs = gstack.pop(); break;
+        case 'cm': { const m = numArgs(a); if (m.length >= 6) gs.ctm = mmul(m, gs.ctm); break; }
+        case 'gs': {
+          const d = a[0] && safe(() => gss && gss.lookupMaybe(PDFName.of(a[0].v), PDFDict));
+          const ca = d && safe(() => d.lookup(PDFName.of('ca')));
+          if (ca instanceof PDFNumber) gs.alpha = ca.asNumber();
+          break;
+        }
+        case 'BMC': mc.push({ s: o.s, flag: null }); break;
+        case 'BDC': {
+          let flag = null, name = '';
+          const tag = a[0] && a[0].v;
+          if (tag === 'Watermark' || (tag === 'Artifact' && a.some(t => t.t === 'name' && t.v === 'Watermark'))) flag = 'mark';
+          else if (tag === 'OC' && a[1] && a[1].t === 'name') {
+            const ocg = safe(() => props && props.lookup(PDFName.of(a[1].v)));
+            const nm = ocg instanceof PDFDict ? safe(() => ocg.lookup(PDFName.of('Name')).decodeText()) : '';
+            if (nm && /water\s?mark|wasserzeichen|filigran|marca de agua/i.test(nm)) { flag = 'layer'; name = nm; }
+          }
+          mc.push({ s: o.s, flag, name });
+          break;
+        }
+        case 'EMC': {
+          const m = mc.pop();
+          if (m && m.flag && !inWm()) items.push({
+            key: m.flag === 'mark' ? 'mark:wm' : 'layer:' + m.name, kind: m.flag, alpha: 1, angle: 0, s: m.s, e: o.e,
+            label: m.flag === 'mark' ? 'Content tagged as “Watermark”' : 'Layer “' + m.name + '”'
+          });
+          break;
+        }
+        case 'BT': bt = { s: o.s, tm: [1, 0, 0, 1, 0, 0], text: '', has: false }; break;
+        case 'Tm': if (bt) { const m = numArgs(a); if (m.length >= 6) bt.tm = m; } break;
+        case 'Tj': case 'TJ': case "'": case '"':
+          if (bt) {
+            bt.has = true;
+            a.forEach(t => {
+              if (t.t === 'str') { const x = literalText(bytes, t.s, t.e); if (x) bt.text += x; else bt.unread = true; }
+              else if (t.t === 'hex') bt.unread = true;
+              else if (t.t === 'num' && t.v < -200) bt.text += ' ';
+            });
+          }
+          break;
+        case 'ET':
+          if (bt) {
+            if (bt.has && !inWm()) {
+              const ang = angleOf(mmul(bt.tm, gs.ctm)), txt = bt.text.replace(/\s+/g, ' ').trim();
+              items.push({
+                key: 'text:' + hash32(bytes, bt.s, o.e), kind: 'text', alpha: gs.alpha, angle: ang, s: bt.s, e: o.e,
+                label: txt && !bt.unread ? 'Text “' + txt.slice(0, 40) + (txt.length > 40 ? '…' : '') + '”' : 'Text block' + (txt ? ' “' + txt.slice(0, 30) + '”' : '')
+              });
+            }
+            bt = null;
+          }
+          break;
+        case 'Do': {
+          if (inWm() || !a[0]) break;
+          const xo = safe(() => xobjs && xobjs.lookup(PDFName.of(a[0].v)));
+          if (!xo || !xo.dict) break;
+          const isImg = String(xo.dict.get(PDFName.of('Subtype'))) === '/Image';
+          const raw = xo.getContents ? xo.getContents() : xo.contents;
+          const w = numOf(xo.dict.get(PDFName.of('Width'))), hh = numOf(xo.dict.get(PDFName.of('Height')));
+          items.push({
+            key: (isImg ? 'image:' : 'form:') + hash32(raw), kind: isImg ? 'image' : 'form', alpha: gs.alpha, angle: angleOf(gs.ctm), s: o.s, e: o.e,
+            label: isImg ? 'Image ' + w + '×' + hh + ' px' : 'Graphic (form object)'
+          });
+          break;
+        }
+        case 'BI': biStart = o.s; break;
+        case 'EI':
+          if (biStart >= 0) {
+            if (!inWm()) items.push({ key: 'inline:' + hash32(bytes, biStart, o.e), kind: 'image', alpha: gs.alpha, angle: angleOf(gs.ctm), s: biStart, e: o.e, label: 'Inline image' });
+            biStart = -1;
+          }
+          break;
+      }
+    }
+  }
+  const an = safe(() => page.node.Annots());
+  if (an) {
+    for (let i = 0; i < an.size(); i++) {
+      const d = safe(() => an.lookup(i));
+      const st = d instanceof PDFDict ? String(d.get(PDFName.of('Subtype'))) : '';
+      if (st === '/Watermark') items.push({ key: 'annot:wm', kind: 'annot', alpha: 1, angle: 0, label: 'Watermark annotation' });
+      else if (st === '/Stamp') items.push({ key: 'annot:stamp', kind: 'annot', alpha: 1, angle: 0, label: 'Stamp annotations' });
+    }
+  }
+  return { bytes, items };
+}
+
+/* Delete every item whose key is in `keys`. Returns how many objects were removed. */
+function removeWatermarks(pdf, keys) {
+  let count = 0;
+  const SP = new Uint8Array([32]);
+  pdf.getPages().forEach(page => {
+    const a = analyzePage(page);
+    const hit = a.items.filter(x => keys.has(x.key));
+    if (!hit.length) return;
+    const rm = hit.filter(x => x.s != null).sort((p, q) => p.s - q.s);
+    if (rm.length && a.bytes) {
+      const parts = []; let pos = 0;
+      rm.forEach(x => {
+        count++;
+        if (x.e <= pos) return;
+        parts.push(a.bytes.subarray(pos, Math.max(x.s, pos)), SP); pos = x.e;
+      });
+      parts.push(a.bytes.subarray(pos));
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let o = 0; parts.forEach(p => { out.set(p, o); o += p.length; });
+      page.node.set(PDFName.of('Contents'), pdf.context.register(pdf.context.flateStream(out)));
+    }
+    const wantWm = keys.has('annot:wm'), wantSt = keys.has('annot:stamp');
+    if (wantWm || wantSt) {
+      const an = safe(() => page.node.Annots());
+      if (an) {
+        const keep = []; let any = false;
+        for (let i = 0; i < an.size(); i++) {
+          const d = safe(() => an.lookup(i));
+          const st = d instanceof PDFDict ? String(d.get(PDFName.of('Subtype'))) : '';
+          if ((wantWm && st === '/Watermark') || (wantSt && st === '/Stamp')) { any = true; count++; } else keep.push(an.get(i));
+        }
+        if (any) page.node.set(PDFName.of('Annots'), pdf.context.obj(keep));
+      }
+    }
+  });
+  return count;
+}
+
+/* ---------- the tool ---------- */
+tool({
+  id: 'unwatermark', title: 'Remove Watermark', icon: '🧽', color: '#0891b2', cat: 'Edit',
+  desc: 'Delete watermarks that were added as separate objects, or cover a watermark with a coloured box.',
+  render(root) {
+    let cands = [], sel = new Set(), userChose = false, scanning = false, scanId = 0;
+    let rects = [], drag = null, pickMode = false, curOrig = null, refreshTimer = null, refreshTok = 0;
+
+    const form = makeForm(onForm);
+    const pv = createPreview({ onDraw, onFile: f => { curOrig = f; scheduleRefresh(); } });
+    const list = fileList({
+      onChange: () => {
+        pv.setFiles(list.items.map(i => i.file)); go.disabled = !list.items.length; res.hide();
+        if (!list.items.length) { userChose = false; sel = new Set(); }
+        scan();
+      }
+    });
+    const res = resultsBox('watermark-removed.zip'), prog = makeProgress();
+
+    const fMode = form.select('mode', 'Method', [['detect', 'Detect and delete the watermark (best quality)'], ['cover', 'Cover an area with a coloured box']], 'detect');
+    const fColor = form.color('color', 'Box colour (match the page background)', '#ffffff');
+    const pg = pagesFields(form);
+    const fSuffix = form.text('suffix', 'Add to file name (optional)', '', 'Empty = same file name as the original');
+    form.custom('sel', { get: () => [...sel], set: a => { sel = new Set(a || []); userChose = true; renderCands(); } });
+    form.custom('rects', { get: () => rects.map(r => ({ ...r })), set: a => { rects = (a || []).map(r => ({ ...r })); renderRects(); } });
+
+    const candBox = h('div'), rectBox = h('div');
+    const pickBtn = h('button', { onclick: () => { pickMode = !pickMode; pickBtn.textContent = pickMode ? 'Click the page to pick…' : '🎨 Pick colour from page'; } }, '🎨 Pick colour from page');
+    const detectGroup = h('div', null,
+      h('div', { class: 'note' }, 'Works for watermarks stored as separate text, images, layers or annotations (this site\'s Add Watermark, Word, Acrobat and most generators). Tick what to delete; the preview shows the result.'),
+      candBox,
+      h('div', { class: 'btnrow' }, h('button', { onclick: () => scan() }, '↻ Scan again')));
+    const coverGroup = h('div', null,
+      h('div', { class: 'note' }, 'Drag a rectangle over the watermark on the preview. Use this when the watermark is part of the page image (scans, flattened PDFs). The text underneath is hidden, not deleted.'),
+      rectBox, fColor, h('div', { class: 'btnrow' }, pickBtn), pg.el);
+    const go = h('button', { class: 'primary', disabled: true, onclick: run }, 'Remove watermark');
+
+    /* ----- form changes ----- */
+    function onForm() {
+      const m = form.c.mode.get();
+      detectGroup.classList.toggle('hide', m !== 'detect');
+      coverGroup.classList.toggle('hide', m !== 'cover');
+      pg.sync();
+      pv.canvas.style.cursor = m === 'cover' ? 'crosshair' : '';
+      if (m === 'detect') scheduleRefresh(); else { scheduleRefresh(); pv.draw(); }
+    }
+
+    /* ----- detect: scan ----- */
+    async function scan() {
+      const my = ++scanId; scanning = true; renderCands();
+      const agg = new Map();
+      for (const it of list.items) {
+        try {
+          const pdf = await loadLib(it.file), pages = pdf.getPages(), perFile = new Map();
+          for (let i = 0; i < pages.length; i++) {
+            analyzePage(pages[i]).items.forEach(x => {
+              let e = perFile.get(x.key);
+              if (!e) { e = { ...x, pages: new Set() }; perFile.set(x.key, e); }
+              e.pages.add(i);
+              if (x.alpha < e.alpha) e.alpha = x.alpha;
+            });
+            if (i % 10 === 9) { await new Promise(r => setTimeout(r)); if (my !== scanId) return; }
+          }
+          perFile.forEach((e, key) => {
+            let c = agg.get(key);
+            if (!c) { c = { key, kind: e.kind, label: e.label, alpha: e.alpha, angle: e.angle, withPages: 0, totalPages: 0, files: 0 }; agg.set(key, c); }
+            c.withPages += e.pages.size; c.totalPages += pages.length; c.files++;
+            if (e.alpha < c.alpha) c.alpha = e.alpha;
+          });
+        } catch (e) { console.error(e); }
+        if (my !== scanId) return;
+      }
+      if (my !== scanId) return;
+      const out = [];
+      agg.forEach(c => {
+        const cov = c.withPages / Math.max(1, c.totalPages), faded = c.alpha < 0.95, tilted = isTilted(c.angle);
+        const tagged = c.kind === 'mark' || c.kind === 'layer' || c.key === 'annot:wm';
+        c.cov = cov; c.faded = faded; c.tilted = tilted;
+        c.likely = tagged || (cov >= 0.7 && (faded || tilted));
+        const show = tagged || c.kind === 'annot' || (c.totalPages > 1 && c.withPages >= 2 && cov >= 0.5) || faded || tilted;
+        if (show) out.push(c);
+      });
+      out.sort((p, q) => (q.likely - p.likely) || (q.cov - p.cov));
+      cands = out.slice(0, 40); scanning = false;
+      if (!userChose) cands.forEach(c => { if (c.likely) sel.add(c.key); });
+      renderCands(); scheduleRefresh();
+    }
+    function renderCands() {
+      candBox.innerHTML = '';
+      if (scanning) { candBox.append(h('div', { class: 'note' }, 'Scanning…')); return; }
+      if (!list.items.length) { candBox.append(h('div', { class: 'note' }, 'Add a PDF to scan it for watermarks.')); return; }
+      if (!cands.length) { candBox.append(h('div', { class: 'warn' }, 'No separate watermark object was found. It is probably part of the page image. Switch the method to “Cover an area”.')); return; }
+      cands.forEach(c => {
+        const cb = h('input', { type: 'checkbox', onchange: () => { userChose = true; cb.checked ? sel.add(c.key) : sel.delete(c.key); scheduleRefresh(); } });
+        cb.checked = sel.has(c.key);
+        const sub = ['On ' + c.withPages + ' of ' + c.totalPages + ' pages'];
+        if (c.faded) sub.push(Math.round(c.alpha * 100) + '% opacity');
+        if (c.tilted) sub.push('rotated ' + c.angle + '°');
+        if (c.files > 1) sub.push(c.files + ' files');
+        candBox.append(h('label', { class: 'cand' }, cb, h('div', null,
+          h('div', { class: 'cl' }, c.label, c.likely ? h('span', { class: 'badge' }, 'Likely watermark') : null),
+          h('div', { class: 'meta' }, sub.join(' · ')))));
+      });
+    }
+
+    /* ----- preview refresh (detect mode shows the real result) ----- */
+    function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(refreshPreview, 250); }
+    async function refreshPreview() {
+      if (!curOrig) return;
+      const tok = ++refreshTok;
+      try {
+        let file = curOrig;
+        if (form.c.mode.get() === 'detect' && sel.size) {
+          const pdf = await loadLib(curOrig);
+          removeWatermarks(pdf, sel);
+          file = new File([await pdf.save({ useObjectStreams: false })], curOrig.name, { type: 'application/pdf' });
+        }
+        if (tok !== refreshTok) return;
+        pv.reloadFile(file, curOrig);
+      } catch (e) { console.error(e); }
+    }
+
+    /* ----- cover: rectangles on the preview ----- */
+    function onDraw(ctx, { pw, ph, page, total, scale }) {
+      if (form.c.mode.get() !== 'cover') return;
+      const s = form.get(), on = selectPages(s.pagesMode, s.pagesRange, total).has(page - 1), W = pw * scale, H = ph * scale;
+      const all = drag ? rects.concat([drag.rect]) : rects;
+      all.forEach(r => {
+        ctx.save();
+        if (on && r !== (drag && drag.rect)) { ctx.fillStyle = s.color; ctx.fillRect(r.x * W, r.y * H, r.w * W, r.h * H); }
+        else { ctx.fillStyle = 'rgba(239,68,68,.12)'; ctx.fillRect(r.x * W, r.y * H, r.w * W, r.h * H); }
+        ctx.strokeStyle = '#ef4444'; ctx.lineWidth = 2; ctx.setLineDash([7, 5]); ctx.strokeRect(r.x * W, r.y * H, r.w * W, r.h * H);
+        ctx.restore();
+      });
+    }
+    const fracPt = e => { const r = pv.canvas.getBoundingClientRect(); return [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))]; };
+    pv.canvas.style.touchAction = 'none';
+    pv.canvas.addEventListener('pointerdown', e => {
+      if (form.c.mode.get() !== 'cover' || !pv.st.base) return;
+      const [x, y] = fracPt(e);
+      if (pickMode) {
+        const b = pv.st.base, d = b.getContext('2d').getImageData(Math.min(b.width - 1, Math.floor(x * b.width)), Math.min(b.height - 1, Math.floor(y * b.height)), 1, 1).data;
+        form.c.color.set('#' + [d[0], d[1], d[2]].map(v => v.toString(16).padStart(2, '0')).join(''));
+        pickMode = false; pickBtn.textContent = '🎨 Pick colour from page'; pv.draw(); return;
+      }
+      drag = { x0: x, y0: y, rect: { x, y, w: 0, h: 0 } };
+      pv.canvas.setPointerCapture(e.pointerId);
+    });
+    pv.canvas.addEventListener('pointermove', e => {
+      if (!drag) return;
+      const [x, y] = fracPt(e);
+      drag.rect = { x: Math.min(drag.x0, x), y: Math.min(drag.y0, y), w: Math.abs(x - drag.x0), h: Math.abs(y - drag.y0) };
+      pv.draw();
+    });
+    const endDrag = () => {
+      if (!drag) return;
+      if (drag.rect.w > 0.005 && drag.rect.h > 0.005) rects.push(drag.rect);
+      drag = null; renderRects(); pv.draw();
+    };
+    pv.canvas.addEventListener('pointerup', endDrag);
+    pv.canvas.addEventListener('pointercancel', () => { drag = null; pv.draw(); });
+    function renderRects() {
+      rectBox.innerHTML = '';
+      if (!rects.length) rectBox.append(h('div', { class: 'meta' }, 'No area drawn yet.'));
+      rects.forEach((r, i) => rectBox.append(h('div', { class: 'rectrow' },
+        h('span', null, 'Area ' + (i + 1) + ' — ' + Math.round(r.w * 100) + '% × ' + Math.round(r.h * 100) + '% of the page'),
+        h('button', { class: 'x', onclick: () => { rects.splice(i, 1); renderRects(); pv.draw(); } }, '✕'))));
+      if (rects.length) rectBox.append(h('button', { onclick: () => { rects = []; renderRects(); pv.draw(); } }, 'Clear all areas'));
+      pv.draw();
+    }
+
+    /* ----- run ----- */
+    async function run() {
+      await withBusy(go, 'Working…', async () => {
+        const s = form.get(), outs = []; let removed = 0;
+        if (s.mode === 'detect' && !sel.size) throw new Error('Tick at least one item to delete.');
+        if (s.mode === 'cover' && !rects.length) throw new Error('Draw a rectangle on the preview over the watermark first.');
+        for (let i = 0; i < list.items.length; i++) {
+          const f = list.items[i].file; prog.set(i / list.items.length, 'Processing ' + f.name);
+          try {
+            const pdf = await loadLib(f);
+            if (s.mode === 'detect') removed += removeWatermarks(pdf, sel);
+            else {
+              const pages = pdf.getPages(), pick = selectPages(s.pagesMode, s.pagesRange, pages.length), color = hexRgb(s.color);
+              pages.forEach((page, idx) => {
+                if (!pick.has(idx)) return;
+                const pi = pageInfo(page);
+                rects.forEach(r => {
+                  const x0 = r.x * pi.pw, x1 = (r.x + r.w) * pi.pw, y0 = (1 - r.y - r.h) * pi.ph, y1 = (1 - r.y) * pi.ph;
+                  const c = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]].map(([x, y]) => toUser(pi, x, y));
+                  const xs = c.map(p => p[0]), ys = c.map(p => p[1]);
+                  page.drawRectangle({ x: pi.x0 + Math.min(...xs), y: pi.y0 + Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys), color, borderWidth: 0 });
+                  removed++;
+                });
+              });
+            }
+            outs.push({ name: baseName(f.name) + s.suffix + '.pdf', data: await pdf.save() });
+          } catch (e) { console.error(e); toast(f.name + ': ' + (e.message || 'failed'), 'err'); }
+        }
+        prog.hide();
+        if (!outs.length) return;
+        res.show(outs, s.mode === 'detect' ? removed + ' object(s) removed' : removed + ' box(es) added');
+        if (s.mode === 'detect' && !removed) toast('Nothing matched in these files, so they are unchanged.', 'err');
+      });
+    }
+
+    onForm(); renderCands(); renderRects();
+    root.append(splitLayout(panel(null, pv.el), h('div', null,
+      panel('1. PDF files', dropZone({ kind: 'pdf', onFiles: fs => list.add(fs) }), list.el),
+      templateBar('unwatermark', form),
+      panel('2. Method', fMode, detectGroup, coverGroup, fSuffix),
+      h('div', { class: 'warn' }, 'Only remove watermarks from documents you created or have permission to edit.'),
+      panel(null, h('div', { class: 'btnrow' }, go), prog.el, res.el))));
+  }
+});
+
 /* ===================== HOME + ROUTER ===================== */
 const CATS = [
   ['Organize', 'Organize PDF'],
@@ -1359,7 +1821,6 @@ const UNAVAILABLE = [
   ['PDF → Word / PowerPoint / Excel', 'Rebuilding layouts needs a server-side converter.'],
   ['Word / PowerPoint / Excel → PDF', 'Needs an Office rendering engine.'],
   ['OCR PDF', 'Needs a large OCR engine (Tesseract.js can be added later).'],
-  ['Remove watermark', 'Cannot be done reliably in general.'],
   ['Protect / Unlock PDF', 'Needs an encryption library (qpdf WASM can be added later).'],
   ['Repair PDF', 'Needs a dedicated recovery engine.'],
   ['Compare PDF', 'Can be added later.'],
@@ -1398,7 +1859,7 @@ function route() {
   const id = location.hash.replace(/^#\/?/, ''), def = TOOLS.find(t => t.id === id), app = $q('#app');
   app.innerHTML = ''; window.scrollTo(0, 0);
   document.title = def ? def.title + ' · PDF Toolkit' : 'PDF Toolkit';
-  app.classList.toggle('wide', !!def && ['watermark', 'pagenumbers', 'crop', 'edit', 'rotate', 'organize'].includes(def.id));
+  app.classList.toggle('wide', !!def && ['watermark', 'unwatermark', 'pagenumbers', 'crop', 'edit', 'rotate', 'organize'].includes(def.id));
   if (!window.PDFLib || !window.pdfjsLib || !window.JSZip) {
     app.append(h('div', { class: 'banner' }, 'Some libraries could not be loaded from the internet (pdf-lib, pdf.js, JSZip). Check your connection and reload the page.'));
     if (!window.PDFLib) return;
